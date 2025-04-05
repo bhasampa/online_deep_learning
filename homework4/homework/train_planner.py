@@ -1,189 +1,121 @@
-# homework/train_planner.py
-
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import os
-from typing import Optional
 
-# Suppose these are local modules you have
-from homework.models import MLPPlanner, TransformerPlanner, CNNPlanner
 from homework.datasets.road_dataset import RoadDataset
-from homework.metrics import compute_waypoint_error  # Or however your metrics are structured
+from homework.models import load_model, save_model
+from homework.metrics import PlannerMetric
 
 def train(
-    model_name: str,
-    transform_pipeline: str,
-    num_workers: int,
-    lr: float,
-    batch_size: int,
-    num_epoch: int,
-    save_dir: str = "./checkpoints",
+    model_name="mlp_planner",
+    transform_pipeline="state_only",
+    num_workers=4,
+    lr=1e-3,
+    batch_size=128,
+    num_epoch=10,
 ):
-    """
-    Trains a model (MLP, Transformer, CNN, etc.) depending on model_name.
-    """
+    # 1. Create dataset/dataloaders
+    train_set = RoadDataset(split="train", transform_pipeline=transform_pipeline)
+    val_set = RoadDataset(split="val", transform_pipeline=transform_pipeline)
 
-    # -------------------------------------------------------------------------
-    # 1. Create dataset and dataloaders
-    # -------------------------------------------------------------------------
-    # transform_pipeline could be something like "state_only" (no images) or "image_only",
-    # depending on how your RoadDataset is set up.
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
-    train_set = RoadDataset(
-        split="train",
-        transform_pipeline=transform_pipeline,
-    )
-    val_set = RoadDataset(
-        split="val",
-        transform_pipeline=transform_pipeline,
-    )
-
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, drop_last=False)
-
-    # -------------------------------------------------------------------------
-    # 2. Initialize the model
-    # -------------------------------------------------------------------------
-    if model_name == "linear_planner" or model_name == "mlp_planner":
-        model = MLPPlanner()
-    elif model_name == "transformer_planner":
-        model = TransformerPlanner()
-    elif model_name == "cnn_planner":
-        model = CNNPlanner()
-    else:
-        raise ValueError(f"Unknown model_name={model_name}")
-
-    # Move model to GPU if available
+    # 2. Load/Create the model
+    model = load_model(model_name, with_weights=False)  # or you can directly instantiate
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
+    model.to(device)
 
-    # -------------------------------------------------------------------------
-    # 3. Initialize optimizer and loss function
-    # -------------------------------------------------------------------------
+    # 3. Create optimizer / loss
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    # Typically for a regression to (x, y) waypoints, an L1 or L2 loss is used.
-    # L2 is common (MSE). We'll use MSE as an example:
-    criterion = nn.MSELoss()
+    criterion = torch.nn.MSELoss()
 
-    # -------------------------------------------------------------------------
-    # 4. Training loop
-    # -------------------------------------------------------------------------
     best_val_loss = float("inf")
 
     for epoch in range(num_epoch):
+        # ------------------
+        # TRAIN
+        # ------------------
         model.train()
-        total_train_loss = 0.0
+        train_loss = 0.0
+
+        # Create the PlannerMetric to track errors across the train epoch
+        train_metric = PlannerMetric()
 
         for batch in train_loader:
-            # The RoadDataset might return different things depending on the transform pipeline
-            # For "state_only":
-            #   left_boundaries: (B, 10, 2)
-            #   right_boundaries: (B, 10, 2)
-            #   waypoints: (B, 3, 2)
-            #   mask: (B, 3)
-            # For "image_only":
-            #   image: (B, 3, H, W)
-            #   ...
-            # etc.
+            # Depending on transform_pipeline, the batch dict may differ
+            # For "state_only" => "track_left", "track_right", "waypoints", "waypoints_mask"
+            track_left = batch["track_left"].to(device)   # (B, 10, 2)
+            track_right = batch["track_right"].to(device) # (B, 10, 2)
+            waypoints_gt = batch["waypoints"].to(device)  # (B, 3, 2)
+            mask = batch["waypoints_mask"].to(device)      # (B, 3)
 
-            # Example for "state_only":
-            left_boundaries = batch["track_left"].to(device)   # (B, 10, 2)
-            right_boundaries = batch["track_right"].to(device) # (B, 10, 2)
-            waypoints_gt = batch["waypoints"].to(device)        # (B, 3, 2)
-            waypoints_mask = batch["waypoints_mask"].to(device) # (B, 3)
-
-            # Zero the gradients
             optimizer.zero_grad()
 
-            # Forward pass
-            # MLPPlanner / TransformerPlanner expect (left, right) as input.
-            # CNNPlanner expects images. So you might do:
-            if model_name in ["linear_planner", "mlp_planner", "transformer_planner"]:
-                waypoints_pred = model(left_boundaries, right_boundaries)
-            elif model_name == "cnn_planner":
-                images = batch["image"].to(device)  # (B, 3, 96, 128)
-                waypoints_pred = model(images)
-            else:
-                raise ValueError(f"Unknown model_name={model_name}")
+            # forward pass
+            waypoints_pred = model(track_left=track_left, track_right=track_right)
 
-            # Compute loss
-            # If the dataset has a mask for invalid waypoints, you could apply it:
-            # mask shape: (B, 3), so expand to (B, 3, 2) if you want to mask out x,y
-            mask_3d = waypoints_mask.unsqueeze(-1).expand_as(waypoints_pred)  # (B, 3, 2)
-            valid_waypoints_pred = waypoints_pred[mask_3d]
-            valid_waypoints_gt = waypoints_gt[mask_3d]
-
-            loss = criterion(valid_waypoints_pred, valid_waypoints_gt)
+            # compute loss (mask invalid waypoints)
+            # mask => (B, 3), so expand to match shape (B, 3, 2)
+            mask_3d = mask.unsqueeze(-1).expand(-1, -1, 2)
+            loss = criterion(waypoints_pred[mask_3d], waypoints_gt[mask_3d])
             loss.backward()
             optimizer.step()
 
-            total_train_loss += loss.item()
+            train_loss += loss.item()
 
-        avg_train_loss = total_train_loss / len(train_loader)
+            # update PlannerMetric
+            train_metric.add(
+                preds=waypoints_pred,
+                labels=waypoints_gt,
+                labels_mask=mask,
+            )
 
-        # ---------------------------------------------------------------------
-        # 5. Validation loop
-        # ---------------------------------------------------------------------
+        train_loss /= len(train_loader)
+        train_stats = train_metric.compute()
+
+        # ------------------
+        # VALIDATION
+        # ------------------
         model.eval()
-        total_val_loss = 0.0
-
-        # Example metrics from your `compute_waypoint_error` or similar
-        total_longitudinal_error = 0.0
-        total_lateral_error = 0.0
-        n_samples = 0
+        val_loss = 0.0
+        val_metric = PlannerMetric()
 
         with torch.no_grad():
             for batch in val_loader:
-                if model_name in ["linear_planner", "mlp_planner", "transformer_planner"]:
-                    left_boundaries = batch["track_left"].to(device)
-                    right_boundaries = batch["track_right"].to(device)
-                    waypoints_gt = batch["waypoints"].to(device)
-                    waypoints_mask = batch["waypoints_mask"].to(device)
-                    waypoints_pred = model(left_boundaries, right_boundaries)
-                else:
-                    images = batch["image"].to(device)
-                    waypoints_gt = batch["waypoints"].to(device)
-                    waypoints_mask = batch["waypoints_mask"].to(device)
-                    waypoints_pred = model(images)
+                track_left = batch["track_left"].to(device)
+                track_right = batch["track_right"].to(device)
+                waypoints_gt = batch["waypoints"].to(device)
+                mask = batch["waypoints_mask"].to(device)
 
-                mask_3d = waypoints_mask.unsqueeze(-1).expand_as(waypoints_pred)
-                valid_waypoints_pred = waypoints_pred[mask_3d]
-                valid_waypoints_gt = waypoints_gt[mask_3d]
+                waypoints_pred = model(track_left=track_left, track_right=track_right)
 
-                loss = criterion(valid_waypoints_pred, valid_waypoints_gt)
-                total_val_loss += loss.item()
+                mask_3d = mask.unsqueeze(-1).expand(-1, -1, 2)
+                loss = criterion(waypoints_pred[mask_3d], waypoints_gt[mask_3d])
+                val_loss += loss.item()
 
-                # Evaluate your lateral & longitudinal error, e.g.:
-                #   For each sample in the batch, compute error and accumulate
-                #   (B, 3, 2) => compute the difference in x (lateral) and y (longitudinal)
-                #   You might use a function from `metrics.py` like:
-                #   lat_err, lon_err = compute_waypoint_error(waypoints_pred, waypoints_gt, waypoints_mask)
-                #   total_longitudinal_error += sum(lon_err)
-                #   total_lateral_error += sum(lat_err)
-                #   n_samples += ???
+                val_metric.add(
+                    preds=waypoints_pred,
+                    labels=waypoints_gt,
+                    labels_mask=mask,
+                )
 
-        avg_val_loss = total_val_loss / len(val_loader)
-        # If you summed errors over all samples, you can divide by n_samples here
-        # avg_lon_err = total_longitudinal_error / n_samples
-        # avg_lat_err = total_lateral_error / n_samples
+        val_loss /= len(val_loader)
+        val_stats = val_metric.compute()
 
-        print(
-            f"[Epoch {epoch+1}/{num_epoch}] "
-            f"train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f}"
-            # f" lon_err={avg_lon_err:.3f}, lat_err={avg_lat_err:.3f}"
+        # Print some logs
+        print(f"[Epoch {epoch+1}/{num_epoch}] "
+              f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} | "
+              f"train_lat={train_stats['lateral_error']:.4f} train_lon={train_stats['longitudinal_error']:.4f} | "
+              f"val_lat={val_stats['lateral_error']:.4f} val_lon={val_stats['longitudinal_error']:.4f}"
         )
 
-        # ---------------------------------------------------------------------
-        # 6. Save the best model
-        # ---------------------------------------------------------------------
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            os.makedirs(save_dir, exist_ok=True)
-            ckpt_path = os.path.join(save_dir, f"{model_name}_best.pth")
-            torch.save(model.state_dict(), ckpt_path)
-            print(f"  -> New best val loss. Saved model to {ckpt_path}")
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_model(model)
+            print("  -> New best model saved")
 
+
+if __name__ == "__main__":
+    train()  # run with default settings, or pass in your own
